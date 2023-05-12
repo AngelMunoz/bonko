@@ -8,15 +8,17 @@ import io.ktor.client.engine.cio.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.util.*
+import kotlinx.coroutines.runBlocking
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.file.Path
 import java.util.zip.*
-import kotlinx.coroutines.*
+import kotlin.io.path.Path
 
 const val RELEASES_URL_TPL = "https://github.com/oven-sh/bun/releases/download"
 
-public sealed class Platform {
+sealed class Platform {
     object Windows : Platform()
     object MacOS : Platform()
     object Linux : Platform()
@@ -24,9 +26,9 @@ public sealed class Platform {
     object Unknown : Platform()
 
     companion object Helpers {
-        public val current
+        val current
             get(): Platform {
-                val osName = System.getProperty("os.name").toLowerCase()
+                val osName = System.getProperty("os.name").lowercase()
                 val isWindows = osName.contains("win")
                 val isMac = osName.contains("mac")
                 val isLinux = osName.contains("nux") || osName.contains("nix")
@@ -48,13 +50,48 @@ public sealed class Platform {
 
 }
 
-fun unzip(zip: ZipInputStream): String {
+sealed class Arch {
+
+    object X86 : Arch()
+    object X64: Arch()
+    object Aarm32: Arch()
+    object Aarm64: Arch()
+
+    object Unknown: Arch()
+
+    companion object Helpers {
+        val current get(): Arch {
+            val osArch = System.getProperty("os.arch").lowercase()
+            val isX64 = osArch.matches(Regex("^(x8664|amd64|ia32e|em64t|x64)$"))
+            val isX86 = osArch.matches(Regex("^(x8632|x86|i[3-6]86|ia32|x32)$"))
+            val isAarm32 = osArch.contains("arm") || osArch.contains("arm32")
+            val isAarm64 = osArch.contains("aarch64")
+            if (isX64) return X64
+            if (isX86) return X86
+            if (isAarm32) return Aarm32
+            if (isAarm64) return Aarm64
+            return Unknown
+        }
+    }
+
+    fun asString(): String {
+        return when (this) {
+            Aarm64 -> "aarm64"
+            Aarm32 -> "arm"
+            Unknown -> "unknown"
+            X64 -> "x64"
+            X86 -> "x86"
+        }
+    }
+}
+
+fun unzip(parentDir: Path, zip: ZipInputStream): String {
     var firstPath: String? = null
     var entry = zip.nextEntry
 
     while (entry != null) {
-        val filePath = "./downloaded/${entry.name}"
-        val file = File(filePath)
+        val filePath = Path.of(parentDir.toString(), entry.name)
+        val file = filePath.toFile()
 
         if (firstPath == null) {
             firstPath = file.absolutePath
@@ -65,7 +102,7 @@ fun unzip(zip: ZipInputStream): String {
         } else {
             val parentDirs = file.parentFile
             if (parentDirs != null && !parentDirs.isDirectory) file.mkdirs()
-            FileOutputStream(filePath).use {
+            FileOutputStream(file).use {
                 zip.copyTo(it)
             }
         }
@@ -75,10 +112,10 @@ fun unzip(zip: ZipInputStream): String {
     if (firstPath != null) {
         val path = "$firstPath/bun"
         try {
-            var file = File(path)
+            val file = File(path)
             file.setExecutable(true)
         } catch (err: Exception) {
-            println("We couldn't make '$path' Executable...")
+            println("We couldn't make '$path' Executable...s")
         }
     }
 
@@ -117,28 +154,36 @@ class Bun(private val pathToBun: String) {
     }
 }
 
-suspend fun setupBun(targetPath: String, version: String): String {
+suspend fun setupBun(targetPath: String, version: String, requestBaseline: Boolean = false): String {
     val tag = "bun-v$version"
     val os = Platform.current.asString()
-    val arch: String = "x64"
-    val isBaseline: Boolean = false
-    val baseline = if (isBaseline) "-baseline" else ""
+    val arch: String = Arch.current.asString()
+    val baseline = if (requestBaseline) "-baseline" else ""
     val targetName = "bun-$os-$arch$baseline"
-    val file = File("$targetPath/$targetName/bun")
+
+    val downloadPath = Path("$targetPath/v$version")
+
+    val binPath = Path("$downloadPath/$targetName/bun").toAbsolutePath()
+    val file = binPath.toFile()
+
+    println("Checking for bun at: '$binPath'")
 
     if (!file.exists()) {
-        val zipContent = downloadBun(tag, os, arch, isBaseline)
+        println("Bun Not found, downloading...")
+        val zipContent = downloadBun(tag, os, arch, requestBaseline)
         val zip = ZipInputStream(ByteArrayInputStream(zipContent))
-        return unzip(zip)
+        val path = unzip(downloadPath , zip)
+        return "$path/bun"
     } else {
+        println("Bun is alredy there!")
         return file.absolutePath
     }
 }
 
-suspend fun main() {
+fun main() {
     println("Setting up Bun...")
-    val path = setupBun("./downloaded/bun-darwin-x64", "0.5.9")
-    println("Downloaded to $path")
-    val cmd = Bun("$path/bun").addVersion().build()
+    val path = runBlocking { setupBun("./downloaded", "0.5.9") }
+    val cmd = Bun(path).addVersion().build()
     cmd.waitFor()
+
 }
