@@ -15,6 +15,7 @@ import java.io.FileOutputStream
 import java.nio.file.Path
 import java.util.zip.*
 import kotlin.io.path.Path
+import com.google.common.io.Resources
 
 const val RELEASES_URL_TPL = "https://github.com/oven-sh/bun/releases/download"
 
@@ -53,25 +54,26 @@ sealed class Platform {
 sealed class Arch {
 
     object X86 : Arch()
-    object X64: Arch()
-    object Aarm32: Arch()
-    object Aarm64: Arch()
+    object X64 : Arch()
+    object Aarm32 : Arch()
+    object Aarm64 : Arch()
 
-    object Unknown: Arch()
+    object Unknown : Arch()
 
     companion object Helpers {
-        val current get(): Arch {
-            val osArch = System.getProperty("os.arch").lowercase()
-            val isX64 = osArch.matches(Regex("^(x8664|amd64|ia32e|em64t|x64)$"))
-            val isX86 = osArch.matches(Regex("^(x8632|x86|i[3-6]86|ia32|x32)$"))
-            val isAarm32 = osArch.contains("arm") || osArch.contains("arm32")
-            val isAarm64 = osArch.contains("aarch64")
-            if (isX64) return X64
-            if (isX86) return X86
-            if (isAarm32) return Aarm32
-            if (isAarm64) return Aarm64
-            return Unknown
-        }
+        val current
+            get(): Arch {
+                val osArch = System.getProperty("os.arch").lowercase()
+                val isX64 = osArch.matches(Regex("^(x8664|amd64|ia32e|em64t|x64)$"))
+                val isX86 = osArch.matches(Regex("^(x8632|x86|i[3-6]86|ia32|x32)$"))
+                val isAarm32 = osArch.contains("arm") || osArch.contains("arm32")
+                val isAarm64 = osArch.contains("aarch64")
+                if (isX64) return X64
+                if (isX86) return X86
+                if (isAarm32) return Aarm32
+                if (isAarm64) return Aarm64
+                return Unknown
+            }
     }
 
     fun asString(): String {
@@ -132,28 +134,6 @@ suspend fun downloadBun(tag: String, os: String, arch: String, isBaseline: Boole
     return channel
 }
 
-class Bun(private val pathToBun: String) {
-    private val args = mutableListOf<String>()
-
-    private fun add(arg: String): Bun {
-        args.add(arg)
-        return this
-    }
-
-    fun addVersion(): Bun {
-        this.add("--version")
-        return this
-    }
-
-    fun build(): Process {
-        return ProcessBuilder(pathToBun, *args.toTypedArray())
-                .redirectError(ProcessBuilder.Redirect.INHERIT)
-                .redirectInput(ProcessBuilder.Redirect.INHERIT)
-                .redirectOutput(ProcessBuilder.Redirect.INHERIT)
-                .start()
-    }
-}
-
 suspend fun setupBun(targetPath: String, version: String, requestBaseline: Boolean = false): String {
     val tag = "bun-v$version"
     val os = Platform.current.asString()
@@ -168,22 +148,67 @@ suspend fun setupBun(targetPath: String, version: String, requestBaseline: Boole
 
     println("Checking for bun at: '$binPath'")
 
-    if (!file.exists()) {
-        println("Bun Not found, downloading...")
-        val zipContent = downloadBun(tag, os, arch, requestBaseline)
-        val zip = ZipInputStream(ByteArrayInputStream(zipContent))
-        val path = unzip(downloadPath , zip)
-        return "$path/bun"
-    } else {
-        println("Bun is alredy there!")
-        return file.absolutePath
-    }
+    val bunPath =
+            if (!file.exists()) {
+                println("Bun Not found, downloading...")
+                val zipContent = downloadBun(tag, os, arch, requestBaseline)
+                val zip = ZipInputStream(ByteArrayInputStream(zipContent))
+                val path = unzip(downloadPath, zip)
+                "$path/bun"
+            } else {
+                println("Bun is alredy there!")
+                file.absolutePath
+            }
+
+    return bunPath
 }
+
+
+data class Bun(val path: String)
+
+fun Bun.transpile(loader: String, code: String): Pair<String, String> {
+    val resource = Resources.getResource("index.js")
+    val indexFile = Path.of(resource.toURI())
+    val transpileProcess =
+            ProcessBuilder(this.path, indexFile.toAbsolutePath().toString(), loader, code)
+                    .redirectError(ProcessBuilder.Redirect.PIPE)
+                    .redirectInput(ProcessBuilder.Redirect.PIPE)
+                    .redirectInput(ProcessBuilder.Redirect.PIPE)
+                    .inheritIO()
+                    .start()
+    transpileProcess.waitFor()
+    val resulting = transpileProcess.inputStream.readAllBytes().decodeToString()
+    val resultingErrors = transpileProcess.errorStream.readAllBytes().decodeToString()
+
+    return Pair(resulting, resultingErrors)
+}
+
+fun Bun.transpile(file: File): Pair<String, String> {
+    val loader = file.extension.lowercase()
+    val isValidFile = loader.matches(Regex("^(js|ts|jsx|tsx)$"))
+    if (!isValidFile) {
+        return Pair("", "The '${loader}' is not a valid file extension.")
+    }
+    val content = file.readText()
+    return this.transpile(loader, content)
+}
+
 
 fun main() {
     println("Setting up Bun...")
     val path = runBlocking { setupBun("./downloaded", "0.5.9") }
-    val cmd = Bun(path).addVersion().build()
-    cmd.waitFor()
+    val bun = Bun(path)
 
+    println("Transpiling Typescript code String: 'const a: string = \"10\";'")
+    val (result, errs) = bun.transpile("ts", "const a: string = \"10\";")
+    println(result)
+    System.err.println(errs)
+
+    val tsxFile = File("./test.jsx")
+    println("Transpiling JSX File: ${tsxFile.path}")
+
+    val (fileResult, fileErrs) = bun.transpile(tsxFile)
+
+    println(fileResult)
+    System.err.println(fileErrs)
 }
